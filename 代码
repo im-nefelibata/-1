@@ -1,0 +1,413 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import LabelEncoder
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix
+from sklearn.model_selection import train_test_split, KFold, StratifiedKFold
+from catboost import CatBoostClassifier, Pool
+from sklearn.impute import SimpleImputer
+import os
+import warnings
+import time
+from datetime import datetime
+
+# 设置中文显示
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
+plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+warnings.filterwarnings("ignore")
+
+# 1. 数据加载与检查
+def load_data(train_path, test_path):
+    """加载数据集并进行基本检查"""
+    print("\n=== 加载数据 ===")
+    try:
+        df = pd.read_csv(train_path)
+        test = pd.read_csv(test_path)
+        print(f"训练集形状: {df.shape}, 测试集形状: {test.shape}")
+        
+        # 显示数据概览
+        print("\n训练集信息:")
+        print(df.info())
+        print("\n测试集信息:")
+        print(test.info())
+        
+        # 显示缺失值情况
+        print("\n训练集缺失值统计:")
+        print(df.isnull().sum().sort_values(ascending=False))
+        print("\n测试集缺失值统计:")
+        print(test.isnull().sum().sort_values(ascending=False))
+        
+        return df, test
+    except Exception as e:
+        print(f"数据加载失败: {str(e)}")
+        return None, None
+
+# 2. 数据预处理
+def preprocess_data(df, test):
+    """数据预处理函数"""
+    print("\n=== 数据预处理 ===")
+    
+    # 复制数据以避免修改原始数据
+    df_processed = df.copy()
+    test_processed = test.copy()
+    
+    # 定义分类变量
+    categorical_cols = [
+        'grade', 'subGrade', 'employmentTitle', 'homeOwnership', 
+        'verificationStatus', 'purpose', 'postCode', 
+        'regionCode', 'initialListStatus', 'applicationType'
+    ]
+    
+    # 只保留实际存在于数据中的分类变量
+    available_categorical_cols = [col for col in categorical_cols if col in df_processed.columns]
+    print(f"分类变量: {available_categorical_cols}")
+    
+    # 处理就业年限字段
+    def process_employment_length(data):
+        if 'employmentLength' in data.columns:
+            print("处理就业年限...")
+            # 转换为字符串类型
+            data['employmentLength'] = data['employmentLength'].astype(str)
+            
+            # 替换文本
+            data['employmentLength'] = data['employmentLength'].str.replace(
+                r' years?|\+|<', '', regex=True
+            )
+            
+            # 特殊值处理
+            data['employmentLength'] = data['employmentLength'].replace({
+                '1': '1',  # 保留1年
+                '10': '10',  # 保留10年
+                'nan': np.nan,  # 确保NaN被识别
+                '': np.nan
+            })
+            
+            # 转换为数值型
+            data['employmentLength'] = pd.to_numeric(data['employmentLength'], errors='coerce')
+        return data
+    
+    df_processed = process_employment_length(df_processed)
+    test_processed = process_employment_length(test_processed)
+    
+    # 日期特征处理
+    def process_dates(data):
+        print("处理日期特征...")
+        # issueDate处理
+        if 'issueDate' in data.columns:
+            # 转换为日期类型
+            data['issueDate'] = pd.to_datetime(data['issueDate'], errors='coerce')
+            
+            # 提取年份和月份
+            data['issueDate_year'] = data['issueDate'].dt.year
+            data['issueDate_month'] = data['issueDate'].dt.month
+            
+            # 处理异常值
+            current_year = datetime.now().year
+            data['issueDate_year'] = data['issueDate_year'].fillna(current_year)
+            data['issueDate_year'] = data['issueDate_year'].clip(lower=2000, upper=current_year)
+            data['issueDate_month'] = data['issueDate_month'].fillna(6)
+            data['issueDate_month'] = data['issueDate_month'].clip(lower=1, upper=12)
+        
+        # earliesCreditLine处理
+        if 'earliesCreditLine' in data.columns:
+            # 处理特殊值
+            data['earliesCreditLine'] = data['earliesCreditLine'].astype(str)
+            data['earliesCreditLine'] = data['earliesCreditLine'].str.replace(r'[^0-9/]', '', regex=True)
+            
+            # 尝试不同日期格式解析
+            for fmt in ['%m/%Y', '%Y/%m', '%m-%Y', '%Y-%m', '%b %Y', '%B %Y']:
+                try:
+                    data['earliesCreditLine'] = pd.to_datetime(
+                        data['earliesCreditLine'], 
+                        errors='coerce',
+                        format=fmt
+                    )
+                    # 如果成功解析，跳出循环
+                    if not data['earliesCreditLine'].isnull().all():
+                        break
+                except:
+                    continue
+            
+            # 提取年份和月份
+            data['earliesCreditLine_year'] = data['earliesCreditLine'].dt.year
+            data['earliesCreditLine_month'] = data['earliesCreditLine'].dt.month
+            
+            # 处理异常值
+            data['earliesCreditLine_year'] = data['earliesCreditLine_year'].fillna(data['earliesCreditLine_year'].median())
+            data['earliesCreditLine_year'] = data['earliesCreditLine_year'].clip(lower=1900, upper=datetime.now().year)
+            data['earliesCreditLine_month'] = data['earliesCreditLine_month'].fillna(6)
+            data['earliesCreditLine_month'] = data['earliesCreditLine_month'].clip(lower=1, upper=12)
+        
+        # 删除原始日期列
+        data = data.drop(['issueDate', 'earliesCreditLine'], axis=1, errors='ignore')
+        
+        return data
+    
+    df_processed = process_dates(df_processed)
+    test_processed = process_dates(test_processed)
+    
+    # 添加新特征
+    if 'annualIncome' in df_processed.columns and 'loanAmnt' in df_processed.columns:
+        print("添加收入贷款比特征...")
+        df_processed['income_loan_ratio'] = df_processed['annualIncome'] / (df_processed['loanAmnt'] + 1e-5)
+        test_processed['income_loan_ratio'] = test_processed['annualIncome'] / (test_processed['loanAmnt'] + 1e-5)
+    
+    # 缺失值处理
+    print("处理缺失值...")
+    def fill_missing(data, train_data=None):
+        # 数值列使用中位数填充
+        numeric_cols = data.select_dtypes(include=['int64', 'float64']).columns
+        for col in numeric_cols:
+            if data[col].isnull().any():
+                if train_data is not None:
+                    # 使用训练集的中位数填充测试集
+                    median_val = train_data[col].median()
+                else:
+                    median_val = data[col].median()
+                data[col] = data[col].fillna(median_val)
+        
+        # 分类列使用众数填充
+        object_cols = data.select_dtypes(include=['object', 'category']).columns
+        for col in object_cols:
+            if data[col].isnull().any():
+                if train_data is not None:
+                    # 使用训练集的众数填充测试集
+                    mode_val = train_data[col].mode()[0]
+                else:
+                    mode_val = data[col].mode()[0]
+                data[col] = data[col].fillna(mode_val)
+        return data
+    
+    df_processed = fill_missing(df_processed)
+    test_processed = fill_missing(test_processed, df_processed)
+    
+    # 确保分类变量为字符串类型
+    for col in available_categorical_cols:
+        if col in df_processed.columns:
+            df_processed[col] = df_processed[col].astype(str)
+        if col in test_processed.columns:
+            test_processed[col] = test_processed[col].astype(str)
+    
+    return df_processed, test_processed, available_categorical_cols
+
+# 3. 数据分析与可视化
+def data_analysis(df):
+    """数据分析与可视化"""
+    print("\n=== 数据分析 ===")
+    
+    # 目标变量分布
+    if 'isDefault' in df.columns:
+        plt.figure(figsize=(8, 6))
+        sns.countplot(x='isDefault', data=df)
+        plt.title('目标变量分布')
+        plt.xlabel('是否违约')
+        plt.ylabel('数量')
+        plt.savefig('target_distribution.png')
+        plt.show()
+    
+    # 数值特征分布
+    numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
+    if len(numeric_cols) > 0:
+        # 选择前9个数值特征展示
+        display_cols = numeric_cols[:9] if len(numeric_cols) > 9 else numeric_cols
+        df[display_cols].hist(bins=20, figsize=(15, 10))
+        plt.suptitle('数值特征分布')
+        plt.tight_layout()
+        plt.savefig('numeric_features_distribution.png')
+        plt.show()
+    
+    # 特征相关性分析
+    if len(numeric_cols) > 1:
+        plt.figure(figsize=(12, 10))
+        corr = df[numeric_cols].corr()
+        sns.heatmap(corr, annot=True, fmt=".2f", cmap='coolwarm')
+        plt.title('特征相关性热力图')
+        plt.tight_layout()
+        plt.savefig('feature_correlation.png')
+        plt.show()
+    
+    # 分类特征分析
+    categorical_cols = df.select_dtypes(include=['object', 'category']).columns
+    if len(categorical_cols) > 0:
+        for col in categorical_cols[:3]:  # 只展示前3个分类特征
+            plt.figure(figsize=(10, 6))
+            if df[col].nunique() > 20:
+                # 对于取值过多的特征，只展示前20个最常见的值
+                top_values = df[col].value_counts().nlargest(20).index
+                df_top = df[df[col].isin(top_values)]
+                sns.countplot(y=col, data=df_top, order=top_values)
+            else:
+                sns.countplot(y=col, data=df)
+            plt.title(f'{col} 分布')
+            plt.tight_layout()
+            plt.savefig(f'{col}_distribution.png')
+            plt.show()
+
+# 4. CatBoost模型训练与评估
+def train_catboost_model(df, test, categorical_cols):
+    """使用CatBoost训练模型并进行交叉验证"""
+    print("\n=== CatBoost模型训练 ===")
+    
+    # 划分特征和目标变量
+    X = df.drop(columns='isDefault')
+    y = df['isDefault']
+    
+    # 初始化模型参数
+    model_params = {
+        'loss_function': 'Logloss',
+        'eval_metric': 'AUC',
+        'task_type': 'CPU',
+        'learning_rate': 0.05,
+        'iterations': 1000,
+        'random_seed': 42,
+        'od_type': 'Iter',
+        'depth': 6,
+        'l2_leaf_reg': 3,
+        'border_count': 128,
+        'verbose': 100
+    }
+    
+    # 交叉验证设置
+    n_folds = 5
+    kf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+    
+    # 存储结果
+    oof_preds = np.zeros(len(df))
+    test_preds = np.zeros(len(test))
+    feature_importances = pd.DataFrame()
+    fold_scores = []
+    models = []
+    
+    print(f"开始 {n_folds} 折交叉验证...")
+    
+    for fold, (train_idx, valid_idx) in enumerate(kf.split(X, y)):
+        print(f"\n=== 训练第 {fold+1} 折 ===")
+        start_time = time.time()
+        
+        # 划分训练集和验证集
+        X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
+        y_train, y_valid = y.iloc[train_idx], y.iloc[valid_idx]
+        
+        # 创建CatBoost Pool
+        train_pool = Pool(
+            data=X_train, 
+            label=y_train, 
+            cat_features=categorical_cols
+        )
+        
+        valid_pool = Pool(
+            data=X_valid, 
+            label=y_valid, 
+            cat_features=categorical_cols
+        )
+        
+        # 初始化模型
+        model = CatBoostClassifier(**model_params)
+        
+        # 训练模型
+        model.fit(
+            train_pool,
+            eval_set=valid_pool,
+            use_best_model=True,
+            plot=False
+        )
+        
+        # 验证集预测
+        valid_pred = model.predict_proba(X_valid)[:, 1]
+        oof_preds[valid_idx] = valid_pred
+        
+        # 计算验证集AUC
+        auc_score = roc_auc_score(y_valid, valid_pred)
+        fold_scores.append(auc_score)
+        
+        # 测试集预测
+        test_pred = model.predict_proba(test)[:, 1]
+        test_preds += test_pred / n_folds
+        
+        # 特征重要性
+        fold_importance = pd.DataFrame({
+            'feature': X.columns,
+            'importance': model.get_feature_importance(),
+            'fold': fold+1
+        })
+        feature_importances = pd.concat([feature_importances, fold_importance], axis=0)
+        
+        # 保存模型
+        model.save_model(f'catboost_model_fold{fold+1}.cbm')
+        models.append(model)
+        
+        end_time = time.time()
+        print(f"第 {fold+1} 折验证集 AUC: {auc_score:.6f}, 耗时: {end_time - start_time:.2f}秒")
+    
+    # 整体评估
+    overall_auc = roc_auc_score(y, oof_preds)
+    print(f"\n整体OOF AUC: {overall_auc:.6f}")
+    print(f"各折AUC: {fold_scores}")
+    print(f"平均验证集 AUC: {np.mean(fold_scores):.6f} ± {np.std(fold_scores):.6f}")
+    
+    # 特征重要性分析
+    mean_importance = feature_importances.groupby('feature')['importance'].mean().sort_values(ascending=False)
+    plt.figure(figsize=(12, 8))
+    mean_importance.head(20).sort_values().plot(kind='barh')
+    plt.title('Top 20 特征重要性')
+    plt.xlabel('重要性')
+    plt.tight_layout()
+    plt.savefig('feature_importance.png')
+    plt.show()
+    
+    # 混淆矩阵
+    best_threshold = 0.5
+    y_pred = (oof_preds > best_threshold).astype(int)
+    cm = confusion_matrix(y, y_pred)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['非违约', '违约'], 
+                yticklabels=['非违约', '违约'])
+    plt.title('混淆矩阵')
+    plt.xlabel('预测')
+    plt.ylabel('实际')
+    plt.tight_layout()
+    plt.savefig('confusion_matrix.png')
+    plt.show()
+    
+    # 生成最终预测结果
+    submission = pd.DataFrame({
+        'id': test['id'] if 'id' in test.columns else range(len(test)),
+        'isDefault': test_preds
+    })
+    
+    # 保存预测结果
+    submission.to_csv('catboost_submission.csv', index=False)
+    print("预测结果已保存至 catboost_submission.csv")
+    
+    return models, overall_auc, mean_importance
+
+# 主函数
+def main():
+    # 1. 加载数据
+    train_path = "train.csv"
+    test_path = "testA.csv"
+    df, test = load_data(train_path, test_path)
+    
+    if df is None or test is None:
+        print("数据加载失败，程序终止")
+        return
+    
+    # 2. 数据预处理
+    df_processed, test_processed, categorical_cols = preprocess_data(df, test)
+    
+    # 3. 数据分析
+    data_analysis(df_processed)
+    
+    # 4. 模型训练
+    models, auc_score, feature_importance = train_catboost_model(df_processed, test_processed, categorical_cols)
+    
+    print("\n=== 流程完成 ===")
+    print(f"最终模型AUC: {auc_score:.6f}")
+    print("\nTop 10 特征重要性:")
+    print(feature_importance.head(10))
+
+if __name__ == "__main__":
+    main()
